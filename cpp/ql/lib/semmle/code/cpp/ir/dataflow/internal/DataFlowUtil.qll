@@ -15,6 +15,7 @@ private import ModelUtil
 private import SsaInternals as Ssa
 private import DataFlowImplCommon as DataFlowImplCommon
 private import codeql.util.Unit
+private import Node0ToString
 
 /**
  * The IR dataflow graph consists of the following nodes:
@@ -39,7 +40,7 @@ private newtype TIRDataFlowNode =
   } or
   TPostUpdateNodeImpl(Operand operand, int indirectionIndex) {
     operand = any(FieldAddress fa).getObjectAddressOperand() and
-    indirectionIndex = [1 .. Ssa::countIndirectionsForCppType(Ssa::getLanguageType(operand))]
+    indirectionIndex = [0 .. Ssa::countIndirectionsForCppType(Ssa::getLanguageType(operand))]
     or
     Ssa::isModifiableByCall(operand, indirectionIndex)
   } or
@@ -436,7 +437,12 @@ class Node extends TIRDataFlowNode {
    * `x.set(taint())` is a partial definition of `x`, and `transfer(&x, taint())` is
    * a partial definition of `&x`).
    */
-  Expr asPartialDefinition() { result = this.(PartialDefinitionNode).getDefinedExpr() }
+  Expr asPartialDefinition() {
+    exists(PartialDefinitionNode pdn | this = pdn |
+      pdn.getIndirectionIndex() > 0 and
+      result = pdn.getDefinedExpr()
+    )
+  }
 
   /**
    * Gets an upper bound on the type of this node.
@@ -478,13 +484,6 @@ class Node extends TIRDataFlowNode {
   string toStringImpl() {
     none() // overridden by subclasses
   }
-}
-
-private string toExprString(Node n) {
-  result = n.asExpr(0).toString()
-  or
-  not exists(n.asExpr()) and
-  result = n.asIndirectExpr(0, 1).toString() + " indirection"
 }
 
 /**
@@ -549,7 +548,10 @@ Type stripPointer(Type t) {
   result = t.(FunctionPointerIshType).getBaseType()
 }
 
-private class PostUpdateNodeImpl extends PartialDefinitionNode, TPostUpdateNodeImpl {
+/**
+ * INTERNAL: Do not use.
+ */
+class PostUpdateNodeImpl extends PartialDefinitionNode, TPostUpdateNodeImpl {
   int indirectionIndex;
   Operand operand;
 
@@ -563,11 +565,17 @@ private class PostUpdateNodeImpl extends PartialDefinitionNode, TPostUpdateNodeI
   Operand getOperand() { result = operand }
 
   /** Gets the indirection index associated with this node. */
-  int getIndirectionIndex() { result = indirectionIndex }
+  override int getIndirectionIndex() { result = indirectionIndex }
 
   override Location getLocationImpl() { result = operand.getLocation() }
 
-  final override Node getPreUpdateNode() { hasOperandAndIndex(result, operand, indirectionIndex) }
+  final override Node getPreUpdateNode() {
+    indirectionIndex > 0 and
+    hasOperandAndIndex(result, operand, indirectionIndex)
+    or
+    indirectionIndex = 0 and
+    result.asOperand() = operand
+  }
 
   final override Expr getDefinedExpr() {
     result = operand.getDef().getUnconvertedResultExpression()
@@ -771,10 +779,12 @@ class IndirectParameterNode extends Node instanceof IndirectInstruction {
   override Location getLocationImpl() { result = this.getParameter().getLocation() }
 
   override string toStringImpl() {
-    result = this.getParameter().toString() + " indirection"
-    or
-    not exists(this.getParameter()) and
-    result = "this indirection"
+    exists(string prefix | prefix = stars(this) |
+      result = prefix + this.getParameter().toString()
+      or
+      not exists(this.getParameter()) and
+      result = prefix + "this"
+    )
   }
 }
 
@@ -836,12 +846,14 @@ class IndirectArgumentOutNode extends PostUpdateNodeImpl {
   Function getStaticCallTarget() { result = this.getCallInstruction().getStaticCallTarget() }
 
   override string toStringImpl() {
-    // This string should be unique enough to be helpful but common enough to
-    // avoid storing too many different strings.
-    result = this.getStaticCallTarget().getName() + " output argument"
-    or
-    not exists(this.getStaticCallTarget()) and
-    result = "output argument"
+    exists(string prefix | if indirectionIndex > 0 then prefix = "" else prefix = "pointer to " |
+      // This string should be unique enough to be helpful but common enough to
+      // avoid storing too many different strings.
+      result = prefix + this.getStaticCallTarget().getName() + " output argument"
+      or
+      not exists(this.getStaticCallTarget()) and
+      result = prefix + "output argument"
+    )
   }
 }
 
@@ -947,7 +959,8 @@ private Type getTypeImpl0(Type t, int indirectionIndex) {
  *
  * If `indirectionIndex` cannot be stripped off `t`, an `UnknownType` is returned.
  */
-bindingset[indirectionIndex]
+bindingset[t, indirectionIndex]
+pragma[inline_late]
 Type getTypeImpl(Type t, int indirectionIndex) {
   result = getTypeImpl0(t, indirectionIndex)
   or
@@ -999,7 +1012,7 @@ private module RawIndirectNodes {
     }
 
     override string toStringImpl() {
-      result = operandNode(this.getOperand()).toStringImpl() + " indirection"
+      result = stars(this) + operandNode(this.getOperand()).toStringImpl()
     }
   }
 
@@ -1041,7 +1054,7 @@ private module RawIndirectNodes {
     }
 
     override string toStringImpl() {
-      result = instructionNode(this.getInstruction()).toStringImpl() + " indirection"
+      result = stars(this) + instructionNode(this.getInstruction()).toStringImpl()
     }
   }
 
@@ -1134,9 +1147,7 @@ class FinalParameterNode extends Node, TFinalParameterNode {
     result instanceof UnknownDefaultLocation
   }
 
-  override string toStringImpl() {
-    if indirectionIndex > 1 then result = p.toString() + " indirection" else result = p.toString()
-  }
+  override string toStringImpl() { result = stars(this) + p.toString() }
 }
 
 /**
@@ -1699,6 +1710,10 @@ abstract class PostUpdateNode extends Node {
  * ```
  */
 abstract private class PartialDefinitionNode extends PostUpdateNode {
+  /** Gets the indirection index of this node. */
+  abstract int getIndirectionIndex();
+
+  /** Gets the expression that is partially defined by this node. */
   abstract Expr getDefinedExpr();
 }
 
@@ -1713,6 +1728,8 @@ abstract private class PartialDefinitionNode extends PostUpdateNode {
  * `getVariableAccess()` equal to `x`.
  */
 class DefinitionByReferenceNode extends IndirectArgumentOutNode {
+  DefinitionByReferenceNode() { this.getIndirectionIndex() > 0 }
+
   /** Gets the unconverted argument corresponding to this node. */
   Expr getArgument() { result = this.getAddressOperand().getDef().getUnconvertedResultExpression() }
 
@@ -1764,9 +1781,7 @@ class VariableNode extends Node, TVariableNode {
     result instanceof UnknownDefaultLocation
   }
 
-  override string toStringImpl() {
-    if indirectionIndex = 1 then result = v.toString() else result = v.toString() + " indirection"
-  }
+  override string toStringImpl() { result = stars(this) + v.toString() }
 }
 
 /**
@@ -2226,6 +2241,25 @@ class Content extends TContent {
   abstract predicate impliesClearOf(Content c);
 }
 
+private module ContentStars {
+  private int maxNumberOfIndirections() { result = max(any(Content c).getIndirectionIndex()) }
+
+  private string repeatStars(int n) {
+    n = 0 and result = ""
+    or
+    n = [1 .. maxNumberOfIndirections()] and
+    result = "*" + repeatStars(n - 1)
+  }
+
+  /**
+   * Gets the number of stars (i.e., `*`s) needed to produce the `toString`
+   * output for `c`.
+   */
+  string contentStars(Content c) { result = repeatStars(c.getIndirectionIndex() - 1) }
+}
+
+private import ContentStars
+
 /** A reference through a non-union instance field. */
 class FieldContent extends Content, TFieldContent {
   Field f;
@@ -2233,11 +2267,7 @@ class FieldContent extends Content, TFieldContent {
 
   FieldContent() { this = TFieldContent(f, indirectionIndex) }
 
-  override string toString() {
-    indirectionIndex = 1 and result = f.toString()
-    or
-    indirectionIndex > 1 and result = f.toString() + " indirection"
-  }
+  override string toString() { result = contentStars(this) + f.toString() }
 
   Field getField() { result = f }
 
@@ -2266,11 +2296,7 @@ class UnionContent extends Content, TUnionContent {
 
   UnionContent() { this = TUnionContent(u, bytes, indirectionIndex) }
 
-  override string toString() {
-    indirectionIndex = 1 and result = u.toString()
-    or
-    indirectionIndex > 1 and result = u.toString() + " indirection"
-  }
+  override string toString() { result = contentStars(this) + u.toString() }
 
   /** Gets a field of the underlying union of this `UnionContent`, if any. */
   Field getAField() { result = u.getAField() and getFieldSize(result) = bytes }
